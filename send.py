@@ -8,22 +8,22 @@ import itertools
 import threading
 
 LSR = '10.0.0.6'
-PROTO = 'ssh'
-USER='cisco'
-PASS='cisco'
+PROTO = 'telnet'
+USER = 'cisco'
+PASS = 'cisco'
 ICMPSIZE = 1000
 DSCP = 40
 
 
-def get_targets(lsr, user, password,proto):
+def get_targets(lsr, user, password, proto):
     import pexpect
     import StringIO
     import re
-    if proto=='telnet':
+    if proto == 'telnet':
         p = pexpect.spawn('telnet '+lsr)
         p.expect('sername')
         p.sendline(user)
-    elif proto=='ssh':
+    elif proto == 'ssh':
         p = pexpect.spawn('ssh '+user+'@'+lsr)
     p.expect('ssword')
     p.sendline(password)
@@ -237,7 +237,7 @@ DST_MAC_INT = send_arp(INTERFACE, SRC, SRC_MAC, LSR)
 if DST_MAC_INT is False:
     print "ARP reply not received"
     exit(-1)
-TARGETS = get_targets(LSR,USER,PASS,PROTO)
+TARGETS = get_targets(LSR, USER, PASS, PROTO)
 # Create all possible variations of targets
 for target in itertools.permutations(TARGETS, 2):
     IDENTIFIER = random.randint(0, 0xffff)
@@ -253,6 +253,10 @@ pingRcvThread.start()
 
 # Send ICMP to targets is send_list
 for pkt_id, pkt in enumerate(send_list):
+    while len([i for i in send_list if i['ts'] > 0
+              and time.time()-i['ts'] < 2
+              and not i['rcvd']]) > 10:
+        time.sleep(0.1)
     ethernet_packet = create_l2_header(SRC_MAC, DST_MAC_INT, pkt['label'])
     icmp_header = create_l4_header(pkt['id'], pkt['seq'], ICMPSIZE)
     ipv4_header = create_l3_header(SRC, pkt['dst'], len(icmp_header), DSCP)
@@ -272,7 +276,8 @@ for pkt_id, pkt in enumerate(send_list):
             (pkt_id, SRC, pkt['label'], pkt['dst'])
         lost += 1
     elif pkt['rcvd'] is True:
-        print "Packet %i with (SRC=>LABEL=>DST)=(%s=>%i=>%s) rcvd in %5.3fms" % \
+        print "Packet %i with (SRC=>LABEL=>DST)=(%s=>%i=>%s) \
+rcvd in %5.3fms" % \
             (pkt_id, SRC, pkt['label'], pkt['dst'], pkt['rtt'])
         rcvd += 1
 print "Summary: Rcvd: %i, Lost: %i" % (rcvd, lost)
