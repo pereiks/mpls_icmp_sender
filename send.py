@@ -6,31 +6,92 @@ import time
 import select
 import itertools
 import threading
-
-LSR = '10.0.0.6'
-PROTO = 'telnet'
-USER = 'cisco'
-PASS = 'cisco'
-ICMPSIZE = 1000
-DSCP = 40
+import argparse
+import pexpect
+import StringIO
+import re
+import ping  # Local file ping.py
 
 
-def get_targets(lsr, user, password, proto):
-    import pexpect
-    import StringIO
-    import re
+parser = argparse.ArgumentParser(description='Test Packets trtansmission \
+between PE devices in MPLS domain')
+parser.add_argument('targets',
+                    metavar='<filename>',
+                    type=str,
+                    help='File with loopbacks, one per line')
+parser.add_argument('lsr',
+                    metavar='<LSR_IP>',
+                    type=str,
+                    help='Nexthop for MPLS packets')
+parser.add_argument('--proto',
+                    metavar='<telnet|ssh>',
+                    type=str,
+                    help='Protocol, used for connection to LSR, \
+default is telnet',
+                    choices=['telnet', 'ssh'],
+                    default='telnet')
+parser.add_argument('--login',
+                    metavar='<user>',
+                    type=str,
+                    help='Username on LSR, default is cisco',
+                    default='cisco')
+parser.add_argument('--password',
+                    metavar='<password>',
+                    type=str,
+                    help='Password on LSR, default is cisco',
+                    default='cisco')
+parser.add_argument('--size',
+                    metavar='<size>',
+                    type=int,
+                    help='Packet size, default is 1500',
+                    default=1500)
+parser.add_argument('--dscp',
+                    metavar='<value>',
+                    type=int,
+                    help='DSCP value in IP packets, default is 0',
+                    default=0)
+parser.add_argument('--queue_size',
+                    metavar='<size>',
+                    type=int,
+                    help='Receive queue size, default is 20 packets',
+                    default=20)
+args = parser.parse_args()
+
+LSR = args.lsr
+PROTO = args.proto
+USER = args.login
+PASS = args.password
+PACKETSIZE = args.size
+if args.dscp in range(0, 64):
+    DSCP = args.dscp
+else:
+    print "Incorrect DSCP"
+    exit(-1)
+TARGETS_FILE = False
+ip_regexp = '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\-' +\
+            '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}'
+if re.match(ip_regexp, args.targets):
+    TARGETS = args.targets.split('-')
+else:
+    TARGETS_FILE = args.targets
+PACKETS_IN_TRANSIT = args.queue_size
+
+
+def get_labels(lsr, user, password, proto):
     if proto == 'telnet':
         p = pexpect.spawn('telnet '+lsr)
         p.expect('sername')
         p.sendline(user)
+        p.expect('ssword')
+        p.sendline(password)
     elif proto == 'ssh':
-        p = pexpect.spawn('ssh '+user+'@'+lsr)
-    p.expect('ssword')
-    p.sendline(password)
-    p.expect('>')
-    p.send('enable\r'+password+'\r')
+        p = pexpect.spawn('ssh -l %s %s' % (user, lsr))
+        index = p.expect(['ssword:', 'continue connecting'])
+        if index == 1:
+            p.sendline("yes")
+            p.expect('ssword:')
+        p.sendline(password)
     p.expect('#')
-
     fh = StringIO.StringIO()
     p.logfile_read = fh
     p.send('terminal length 0\rshow mpls forwarding | i ^[0-9].*/32\r')
@@ -116,7 +177,14 @@ def sendeth(ethernet_packet, payload, interface):
     """Send raw Ethernet packet on interface."""
     s = socket(AF_PACKET, SOCK_RAW)
     s.bind((interface, 0))
-    return s.send(ethernet_packet + payload)
+    try:
+        result = s.send(ethernet_packet + payload)
+    except error as e:
+        print "Error: %s" % e
+        s.close()
+        return -1
+    s.close()
+    return result
 
 
 def receive_ping():
@@ -132,6 +200,7 @@ def receive_ping():
         elif completed is True:
             break
         recPacket, addr = my_socket.recvfrom(10000)
+        tos = int(struct.unpack(">B",recPacket[1:2])[0])
         icmpHeader = recPacket[20:28]
         timeRcvd = time.time()
         type, code, checksum, packetID, sequence = struct.unpack(">bbHHH",
@@ -143,6 +212,8 @@ def receive_ping():
             rtt = time.time() - send_list[pkt_id]['ts']
             send_list[pkt_id]['rtt'] = rtt
             send_list[pkt_id]['rcvd'] = True
+            send_list[pkt_id]['tos'] = tos
+    my_socket.close()
 
 
 def pack(byte_sequence):
@@ -193,7 +264,7 @@ def create_l4_header(id, seq, size):
     TYPE = 8
     CODE = 0
     ICMP_CHECKSUM = 0
-    DATA = 'ff' * size
+    DATA = 'ff' * (size-28)
     icmp_header = '{0:02x}{1:02x}{2:04x}'.format(TYPE, CODE, ICMP_CHECKSUM) +\
                   '{0:04x}{1:04x}{2:s}'.format(id, seq, DATA)
     ICMP_CHECKSUM = '{0:04x}'.format(ipv4_checksum(icmp_header))
@@ -237,14 +308,30 @@ DST_MAC_INT = send_arp(INTERFACE, SRC, SRC_MAC, LSR)
 if DST_MAC_INT is False:
     print "ARP reply not received"
     exit(-1)
-TARGETS = get_targets(LSR, USER, PASS, PROTO)
+LABELS = get_labels(LSR, USER, PASS, PROTO)
+if TARGETS_FILE is not False:
+    try:
+        TARGETS = [line.strip() for line in open(TARGETS_FILE, 'r')]
+    except IOError as e:
+        print "Error: %s" % e.strerror
+        exit(-1)
+ALIVE_TARGETS = []
+for target in TARGETS:
+    status = ping.quiet_ping(target, psize=PACKETSIZE-20, count=2)
+    if status[0] < 100:
+        ALIVE_TARGETS.append(target)
+
 # Create all possible variations of targets
-for target in itertools.permutations(TARGETS, 2):
+for target in itertools.permutations(ALIVE_TARGETS, 2):
     IDENTIFIER = random.randint(0, 0xffff)
     SEQNUM = random.randint(0, 0xffff)
-    send_list.append({'label': int(target[0][0]), 'dst': target[1][1],
-                     'id': IDENTIFIER, 'seq': SEQNUM, 'rcvd': False,
-                     'ts': 0, 'rtt': -1})
+    try:  # Search for loopback in LSDB
+        label = int(next(i[0] for i in LABELS if i[1] == target[0]))
+    except StopIteration:  # Loopback not found in LSDB on LSR, set it to Explicit Null
+        label = 0
+    send_list.append({'label': label, 'dst': target[1],
+                      'id': IDENTIFIER, 'seq': SEQNUM, 'rcvd': False,
+                      'ts': 0, 'rtt': -1})
 
 completed = False  # Set completed flag for thread to False
 # Start ICMP receive thread
@@ -253,12 +340,12 @@ pingRcvThread.start()
 
 # Send ICMP to targets is send_list
 for pkt_id, pkt in enumerate(send_list):
-    while len([i for i in send_list if i['ts'] > 0
+    while len([i for i in send_list if i['ts'] >= PACKETS_IN_TRANSIT
               and time.time()-i['ts'] < 2
               and not i['rcvd']]) > 10:
         time.sleep(0.1)
     ethernet_packet = create_l2_header(SRC_MAC, DST_MAC_INT, pkt['label'])
-    icmp_header = create_l4_header(pkt['id'], pkt['seq'], ICMPSIZE)
+    icmp_header = create_l4_header(pkt['id'], pkt['seq'], PACKETSIZE)
     ipv4_header = create_l3_header(SRC, pkt['dst'], len(icmp_header), DSCP)
     send_list[pkt_id]['ts'] = time.time()
     sendeth(pack(ethernet_packet), pack(ipv4_header + icmp_header),
@@ -276,8 +363,8 @@ for pkt_id, pkt in enumerate(send_list):
             (pkt_id, SRC, pkt['label'], pkt['dst'])
         lost += 1
     elif pkt['rcvd'] is True:
-        print "Packet %i with (SRC=>LABEL=>DST)=(%s=>%i=>%s) \
+        print "Packet %i with (SRC=>LABEL=>DST)=(%s=>%i=>%s) TOS=%i \
 rcvd in %5.3fms" % \
-            (pkt_id, SRC, pkt['label'], pkt['dst'], pkt['rtt'])
+            (pkt_id, SRC, pkt['label'], pkt['dst'], pkt['tos'], pkt['rtt'])
         rcvd += 1
 print "Summary: Rcvd: %i, Lost: %i" % (rcvd, lost)
