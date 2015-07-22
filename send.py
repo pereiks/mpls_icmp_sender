@@ -55,13 +55,30 @@ parser.add_argument('--queue_size',
                     type=int,
                     help='Receive queue size, default is 20 packets',
                     default=20)
+parser.add_argument('--retry',
+                    metavar='<count>',
+                    type=int,
+                    help='Number of tries, if packet is lost, for each packet',
+                    default=2)
+parser.add_argument('--verbose',
+                    action='store_true',
+                    help='Verbose output',
+                    default=False)
+parser.add_argument('--showreceived',
+                    action='store_true',
+                    help='Show received packets',
+                    default=False)
 args = parser.parse_args()
 
+verbose = False
 LSR = args.lsr
 PROTO = args.proto
 USER = args.login
 PASS = args.password
 PACKETSIZE = args.size
+RETRY_COUNT = args.retry
+VERBOSE = args.verbose
+SHOW_RECEIVED = args.showreceived
 if args.dscp in range(0, 64):
     DSCP = args.dscp
 else:
@@ -102,7 +119,7 @@ def get_labels(lsr, user, password, proto):
     targets = []
     expr = r'^([0-9]+).+\s([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\/32'
     for line in contents.split('\n'):
-        if re.match('^[0-9].*/32', line):
+        if re.match('^[0-9]+\s.*/32', line):
             targets.append(re.findall(expr, line)[0])
     return targets
 
@@ -200,7 +217,7 @@ def receive_ping():
         elif completed is True:
             break
         recPacket, addr = my_socket.recvfrom(10000)
-        tos = int(struct.unpack(">B",recPacket[1:2])[0])
+        tos = int(struct.unpack(">B", recPacket[1:2])[0])
         icmpHeader = recPacket[20:28]
         timeRcvd = time.time()
         type, code, checksum, packetID, sequence = struct.unpack(">bbHHH",
@@ -213,6 +230,12 @@ def receive_ping():
             send_list[pkt_id]['rtt'] = rtt
             send_list[pkt_id]['rcvd'] = True
             send_list[pkt_id]['tos'] = tos
+            if SHOW_RECEIVED:
+                print "Packet %i with (SRC=>MIDPOINT(LABEL)=>DST)\
+=(%s=>%s(%i)=>%s) TOS=%i rcvd in %5.3fms" % \
+                    (pkt_id, SRC, send_list[pkt_id]['mid'],
+                        send_list[pkt_id]['label'], send_list[pkt_id]['dst'],
+                        tos, rtt)
     my_socket.close()
 
 
@@ -297,17 +320,35 @@ def create_l3_header(SRC, DST, l4_len, dscp):
     return str2hex(ipv4_header[:20]+CHECKSUM+ipv4_header[24:])
 
 
+if VERBOSE:
+    print "Determing interface name...",
 INTERFACE = get_iface(LSR)  # Get outgoing interface name
 if INTERFACE is False:
     print "LSR is not connected or iface is down"
     exit(-1)
+if VERBOSE:
+    print INTERFACE
 send_list = []  # Initial Send List
+if VERBOSE:
+    print "Determing SRC IP...",
 SRC = get_ip_address(INTERFACE)  # Interface IP
+if VERBOSE:
+    print SRC
+if VERBOSE:
+    print "Determing SRC MAC...",
 SRC_MAC = get_mac_address(INTERFACE)  # Interface MAC
+if VERBOSE:
+    print SRC_MAC
+if VERBOSE:
+    print "Determing LSR MAC by sending ARP...",
 DST_MAC_INT = send_arp(INTERFACE, SRC, SRC_MAC, LSR)
 if DST_MAC_INT is False:
     print "ARP reply not received"
     exit(-1)
+if VERBOSE:
+    print DST_MAC_INT
+if VERBOSE:
+    print "Trying to parse label list from LSR...",
 LABELS = get_labels(LSR, USER, PASS, PROTO)
 if TARGETS_FILE is not False:
     try:
@@ -315,13 +356,25 @@ if TARGETS_FILE is not False:
     except IOError as e:
         print "Error: %s" % e.strerror
         exit(-1)
+if VERBOSE:
+    print "done"
+if VERBOSE:
+    print "Checking if targets is alive by pinging them with size %i..." % PACKETSIZE
 ALIVE_TARGETS = []
 for target in TARGETS:
     status = ping.quiet_ping(target, psize=PACKETSIZE-20, count=2)
     if status[0] < 100:
+        if VERBOSE:
+            print "\tTarget %s is alive" % target
         ALIVE_TARGETS.append(target)
-
+    else:
+        if VERBOSE:
+            print "\tTarget %s is dead" % target
+if VERBOSE:
+    print "Totally %i targets alive" % len(ALIVE_TARGETS)
 # Create all possible variations of targets
+if VERBOSE:
+    print "Creating permutation list from alive targets list...",
 for target in itertools.permutations(ALIVE_TARGETS, 2):
     IDENTIFIER = random.randint(0, 0xffff)
     SEQNUM = random.randint(0, 0xffff)
@@ -329,29 +382,48 @@ for target in itertools.permutations(ALIVE_TARGETS, 2):
         label = int(next(i[0] for i in LABELS if i[1] == target[0]))
     except StopIteration:  # Loopback not found in LSDB on LSR, set it to Explicit Null
         label = 0
-    send_list.append({'label': label, 'dst': target[1],
+    send_list.append({'mid': target[0], 'label': label, 'dst': target[1],
                       'id': IDENTIFIER, 'seq': SEQNUM, 'rcvd': False,
-                      'ts': 0, 'rtt': -1})
-
+                      'ts': 0, 'rtt': -1, 'send_cnt': 0})
+if VERBOSE:
+    print "done"
 completed = False  # Set completed flag for thread to False
 # Start ICMP receive thread
+if VERBOSE:
+    print "Starting receive thread..."
 pingRcvThread = threading.Thread(target=receive_ping)
 pingRcvThread.start()
+if VERBOSE:
+    print "done"
 
 # Send ICMP to targets is send_list
-for pkt_id, pkt in enumerate(send_list):
-    while len([i for i in send_list if i['ts'] >= PACKETS_IN_TRANSIT
-              and time.time()-i['ts'] < 2
-              and not i['rcvd']]) > 10:
-        time.sleep(0.1)
-    ethernet_packet = create_l2_header(SRC_MAC, DST_MAC_INT, pkt['label'])
-    icmp_header = create_l4_header(pkt['id'], pkt['seq'], PACKETSIZE)
-    ipv4_header = create_l3_header(SRC, pkt['dst'], len(icmp_header), DSCP)
-    send_list[pkt_id]['ts'] = time.time()
-    sendeth(pack(ethernet_packet), pack(ipv4_header + icmp_header),
-            INTERFACE)
+if VERBOSE:
+    print "Start sending packets (%i tries)..." % RETRY_COUNT
+iteration = 1
+while len([i for i in send_list if not i['rcvd']
+           and i['send_cnt'] < RETRY_COUNT]) > 0:
+    nodes_left = len([i for i in send_list if not i['rcvd']
+                     and i['send_cnt'] < RETRY_COUNT])
+    if VERBOSE:
+        print "\tTry #%i: %i nodes left" % (iteration, nodes_left)
+    for pkt_id, pkt in enumerate(send_list):
+        if not pkt['rcvd']:
+            while len([i for i in send_list if i['ts'] >= 0
+                      and time.time()-i['ts'] < 2
+                      and not i['rcvd']]) > PACKETS_IN_TRANSIT:
+                time.sleep(0.1)
+            ethernet_packet = create_l2_header(SRC_MAC, DST_MAC_INT, pkt['label'])
+            icmp_header = create_l4_header(pkt['id'], pkt['seq'], PACKETSIZE)
+            ipv4_header = create_l3_header(SRC, pkt['dst'], len(icmp_header), DSCP)
+            send_list[pkt_id]['ts'] = time.time()
+            send_list[pkt_id]['send_cnt'] = send_list[pkt_id]['send_cnt'] + 1
+            sendeth(pack(ethernet_packet), pack(ipv4_header + icmp_header),
+                    INTERFACE)
+    time.sleep(2)  # Wait for all ICMP replies
+    iteration = iteration + 1
 
-time.sleep(2)  # Wait for all ICMP replies
+if VERBOSE:
+    print "All done"
 completed = True  # Set Thread flag to True
 # Pkt counters
 rcvd = 0
@@ -359,12 +431,10 @@ lost = 0
 # Print results
 for pkt_id, pkt in enumerate(send_list):
     if pkt['rcvd'] is False:
-        print "====> Packet %i with (SRC=>LABEL=>DST)=(%s=>%i=>%s) lost" % \
-            (pkt_id, SRC, pkt['label'], pkt['dst'])
+        print "====> Packet %i with (SRC=>MIDPOINT(LABEL)=>DST)=\
+(%s=>%s(%i)=>%s) lost" % \
+            (pkt_id, SRC, pkt['mid'], pkt['label'], pkt['dst'])
         lost += 1
     elif pkt['rcvd'] is True:
-        print "Packet %i with (SRC=>LABEL=>DST)=(%s=>%i=>%s) TOS=%i \
-rcvd in %5.3fms" % \
-            (pkt_id, SRC, pkt['label'], pkt['dst'], pkt['tos'], pkt['rtt'])
         rcvd += 1
 print "Summary: Rcvd: %i, Lost: %i" % (rcvd, lost)
