@@ -1,3 +1,4 @@
+#!/usr/bin/python
 from socket import *
 import fcntl
 import struct
@@ -224,7 +225,7 @@ def receive_ping():
                                                                  icmpHeader)
         pkt_id = next((pkt_id for pkt_id, i in enumerate(send_list)
                       if i['id'] == packetID and i['seq'] == sequence
-                      and i['dst'] == addr[0]), False)
+                      and i['dst'] == addr[0] and not i['rcvd']), False)
         if pkt_id is not False:
             rtt = time.time() - send_list[pkt_id]['ts']
             send_list[pkt_id]['rtt'] = rtt
@@ -376,8 +377,6 @@ if VERBOSE:
 if VERBOSE:
     print "Creating permutation list from alive targets list...",
 for target in itertools.permutations(ALIVE_TARGETS, 2):
-    IDENTIFIER = random.randint(0, 0xffff)
-    SEQNUM = random.randint(0, 0xffff)
     try:  # Search for loopback in LSDB
         label = int(next(i[0] for i in LABELS if i[1] == target[0]))
     except StopIteration:  # Loopback not found in LSDB on LSR, set it to Explicit Null
@@ -412,6 +411,8 @@ while len([i for i in send_list if not i['rcvd']
                       and time.time()-i['ts'] < 2
                       and not i['rcvd']]) > PACKETS_IN_TRANSIT:
                 time.sleep(0.1)
+            send_list[pkt_id]['id'] = random.randint(0, 0xffff) # Add random ICMP ID
+            send_list[pkt_id]['seq'] = random.randint(0, 0xffff) # Add random ICMP SEQ Number
             ethernet_packet = create_l2_header(SRC_MAC, DST_MAC_INT, pkt['label'])
             icmp_header = create_l4_header(pkt['id'], pkt['seq'], PACKETSIZE)
             ipv4_header = create_l3_header(SRC, pkt['dst'], len(icmp_header), DSCP)
